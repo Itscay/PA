@@ -174,13 +174,18 @@ def run(wake_word: str = "hey_jarvis", sensitivity: float = 0.5) -> int:
     """Run the live harness until Ctrl+C. Returns process exit code."""
     harness = ListenHarness(wake_word=wake_word, sensitivity=sensitivity)
 
+    from assistant import paths
+    from assistant.config import load_config
+    cfg = load_config(paths.config_path()).config
+    input_device = cfg.audio.input_device
+
     devices = capture.list_input_devices()
     if not devices:
         print("No microphone input device found.", flush=True)
         return 1
 
     ring = capture.RingBuffer(capture.SAMPLE_RATE * 12)  # 12 s RAM ring (P1)
-    mic = capture.MicCapture(ring, blocksize=1600, on_audio=harness.on_audio)
+    mic = capture.MicCapture(ring, device=input_device, blocksize=1600, on_audio=harness.on_audio)
 
     hotkey: PushToTalk | None = None
     try:

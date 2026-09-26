@@ -34,7 +34,7 @@ class AssistantConfig(BaseModel):
 
 
 class AudioConfig(BaseModel):
-    input_device: str = "default"
+    input_device: int | str = "default"
     stt_model: str = "base.en"
     stt_device: Literal["auto", "cpu", "cuda"] = "auto"
     tts: Literal["sapi", "piper"] = "sapi"
