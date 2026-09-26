@@ -90,11 +90,11 @@ class RingBuffer:
         return np.roll(self._buf, -self._write).copy()
 
 
-def list_input_devices() -> list[dict[str, object]]:
+def list_input_devices() -> list[dict[str, int | str | bool]]:
     """Enumerate host input devices for the Settings device picker."""
     import sounddevice as sd
 
-    out: list[dict[str, object]] = []
+    out: list[dict[str, int | str | bool]] = []
     for i, dev in enumerate(sd.query_devices()):
         if dev["max_input_channels"] > 0:
             out.append(
@@ -115,6 +115,106 @@ def default_input_device() -> int | str:
     return "default" if dev is None else int(dev)
 
 
+def match_device_index(
+    devices: list[dict[str, int | str | bool]], spec: int | str
+) -> int | None:
+    """Resolve a user device spec to an index in ``devices`` (pure, testable).
+
+    ``spec`` may be an index, ``"default"``, or a device-name fragment.
+
+    **Names beat indices**: PortAudio/MME endpoint indices are not stable
+    across runs on Windows -- measured on this machine: the raw DMIC array
+    was index 21 in one process and 18 in the next, and index 21 pointed at
+    a different (broken) endpoint later. A stored index can therefore select
+    the *wrong microphone*, so a numeric spec is only accepted when it
+    still matches, and a string spec is matched by name (case-insensitive,
+    substring) with the default device as fallback.
+    """
+    if isinstance(spec, int):
+        known = {int(d["index"]) for d in devices}
+        return spec if spec in known else None
+    text = str(spec).strip()
+    if not text or text.lower() == "default":
+        return None  # caller uses the host default
+    lowered = text.lower()
+    # Prefer an exact name match, then a substring match.
+    for dev in devices:
+        if str(dev.get("name", "")).strip().lower() == lowered:
+            return int(dev["index"])
+    for dev in devices:
+        if lowered in str(dev.get("name", "")).lower():
+            return int(dev["index"])
+    return None
+
+
+class Resampler:
+    """Streaming mono resampler to 16 kHz (device rates vary: 44.1k/48k/16k).
+
+    Pure and stateful only in its carry samples, so it is unit-testable:
+
+    * integer ratios (48000 -> 16000) use box decimation (average of N
+      samples), which doubles as a cheap anti-alias filter;
+    * everything else (44100 -> 16000) uses linear interpolation with a
+      fractional phase carry so block boundaries stay continuous.
+    """
+
+    def __init__(self, in_rate: int, out_rate: int = SAMPLE_RATE) -> None:
+        if in_rate <= 0 or out_rate <= 0:
+            raise ValueError("rates must be positive")
+        self.in_rate = int(in_rate)
+        self.out_rate = int(out_rate)
+        self._passthrough = self.in_rate == self.out_rate
+        self._factor = (
+            self.in_rate // self.out_rate
+            if self.in_rate % self.out_rate == 0
+            else 0
+        )
+        self._carry = np.zeros(0, dtype=np.float32)
+        # fractional phase in *input* samples for the interpolation path
+        self._phase = 0.0
+
+    @property
+    def ratio(self) -> float:
+        return self.out_rate / self.in_rate
+
+    def process(self, samples: np.ndarray) -> np.ndarray:
+        x = np.asarray(samples, dtype=np.float32).reshape(-1)
+        if self._passthrough or x.size == 0:
+            return x.copy()
+        if self._factor:
+            buf = np.concatenate([self._carry, x])
+            k = (buf.size // self._factor) * self._factor
+            if k == 0:
+                self._carry = buf
+                return np.zeros(0, dtype=np.float32)
+            out = buf[:k].reshape(-1, self._factor).mean(axis=1)
+            self._carry = buf[k:]
+            return out.astype(np.float32)
+        # linear interpolation with phase carry
+        buf = np.concatenate([self._carry, x])
+        step = self.in_rate / self.out_rate  # input samples per output sample
+        max_idx = buf.size - 2  # every output needs buf[i] and buf[i + 1]
+        if max_idx < self._phase:
+            self._carry = buf
+            return np.zeros(0, dtype=np.float32)
+        # outputs at phase, phase+step, ... while the pair still exists
+        out_len = int((max_idx - self._phase) // step) + 1
+        idx = self._phase + step * np.arange(out_len, dtype=np.float64)
+        idx = np.minimum(idx, float(max_idx))  # guard float rounding at the edge
+        i0 = np.floor(idx).astype(np.int64)
+        frac = (idx - i0).astype(np.float32)
+        # i0 is int64, but numpy indexing with int64 array returns Any without stubs.
+        i0_int = i0.astype(int)
+        out = buf[i0_int] * (1.0 - frac) + buf[i0_int + 1] * frac
+        # Keep from the last sample index consumed; the next output is the
+        # one *after* idx[-1] (phase is measured from that kept sample), so
+        # consecutive blocks neither duplicate nor skip a position.
+        keep_from = int(i0[-1])
+        self._phase = float(idx[-1] + step - keep_from)
+        self._carry = buf[keep_from:]
+        return out.astype(np.float32)  # type: ignore[no-any-return]
+
+
 class MicCapture:
     """Owns the sounddevice input stream and feeds a RingBuffer.
 
@@ -126,7 +226,7 @@ class MicCapture:
         ring: RingBuffer,
         device: int | str = "default",
         sample_rate: int = SAMPLE_RATE,
-        blocksize: int = 1600,  # 100 ms
+        blocksize: int = 1600,  # 100 ms at ``sample_rate"
         on_audio: Callable[[np.ndarray], None] | None = None,
     ) -> None:
         self._ring = ring
@@ -139,6 +239,11 @@ class MicCapture:
         self._lock = threading.Lock()
         self.blocks_dropped = 0
         self.last_error: str | None = None
+        # Filled in by start(): what we actually opened.
+        self.opened_device: int | None = None
+        self.opened_rate = 0
+        self.opened_channels = 0
+        self._resampler: Resampler | None = None
 
     @property
     def running(self) -> bool:
@@ -150,6 +255,11 @@ class MicCapture:
             self.blocks_dropped += 1
             log.warning("audio status: %s", status)
         mono = indata.mean(axis=1) if indata.ndim > 1 else indata.reshape(-1)
+        resampler = self._resampler
+        if resampler is not None:
+            mono = resampler.process(mono)
+            if mono.size == 0:  # not enough input yet to emit a 16 kHz block
+                return
         self._ring.append(mono)
         if self._on_audio is not None:
             self._on_audio(mono)
@@ -161,22 +271,67 @@ class MicCapture:
             if self._stream is not None:
                 return
             try:
+                device_index, rate, channels = self._probe(sd)
+                self._resampler = (
+                    None if rate == self._sample_rate else Resampler(rate, self._sample_rate)
+                )
                 self._stream = sd.InputStream(
-                    device=None if self._device == "default" else self._device,
-                    samplerate=self._sample_rate,
-                    channels=1,
+                    device=device_index,
+                    samplerate=rate,
+                    channels=channels,
                     dtype="float32",
-                    blocksize=self._blocksize,
+                    blocksize=max(1, int(round(self._blocksize * rate / self._sample_rate))),
                     callback=self._callback,
                 )
                 self._stream.start()
+                self.opened_device = device_index
+                self.opened_rate = rate
+                self.opened_channels = channels
                 self.last_error = None
-                log.info("mic started (device=%s)", self._device)
+                log.info(
+                    "mic started (device=%s rate=%d ch=%d -> %d Hz)",
+                    device_index,
+                    rate,
+                    channels,
+                    self._sample_rate,
+                )
             except Exception as exc:
                 self._stream = None
                 self.last_error = str(exc)
                 log.error("mic start failed: %s", exc)
                 raise
+
+    def _probe(self, sd: Any) -> tuple[int | None, int, int]:
+        """Pick the device, its native rate, and a channel count that opens.
+
+        Two live findings drove this (Windows, Intel Smart Sound):
+
+        * the default array device rejects ``channels=1`` (PortAudio
+          ``Invalid device``) while others only expose 1 usable channel --
+          so try 1 first and fall back to the device's own count (we
+          downmix in the callback);
+        * devices run at 44.1k/48k/16k natively, so we open at the native
+          rate and resample to 16 kHz instead of forcing 16k on the device.
+        """
+        devices = list_input_devices()
+        index = match_device_index(devices, self._device)
+        info = sd.query_devices(index if index is not None else "input")
+        rate = int(round(float(info["default_samplerate"])))
+        max_ch = int(info["max_input_channels"])
+        last_err: Exception | None = None
+        for channels in (1, min(2, max_ch), max_ch):
+            if channels < 1:
+                continue
+            try:
+                sd.check_input_settings(
+                    device=index, samplerate=rate, channels=channels, dtype="float32"
+                )
+                return index, rate, channels
+            except Exception as exc:  # noqa: PERF203 - probing is inherently retry-y
+                last_err = exc
+        raise RuntimeError(
+            f"no usable input configuration for device {self._device!r}: {last_err}"
+        )
 
     def stop(self) -> None:
         with self._lock:

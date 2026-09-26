@@ -15,6 +15,7 @@ import logging
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 
@@ -83,6 +84,7 @@ class FasterWhisper(SpeechToText):
 
     def _load(self) -> None:
         from faster_whisper import WhisperModel
+        from faster_whisper.utils import download_model
 
         device = self._config.device
         if device == "auto":
@@ -90,9 +92,15 @@ class FasterWhisper(SpeechToText):
         compute = self._config.compute_type
         if device == "cuda" and compute == "int8":
             compute = "float16"
+        # Resolve (and download on first use) the snapshot ourselves so we can
+        # SHA-256 verify it against the pinned manifest before loading (P4/§11).
+        model_path = download_model(self._config.model)
+        from assistant.model_manifest import ensure_verified
+
+        ensure_verified(self._config.model, Path(model_path))
         log.info("loading whisper model=%s device=%s compute=%s",
                  self._config.model, device, compute)
-        self._model = WhisperModel(self._config.model, device=device, compute_type=compute)
+        self._model = WhisperModel(str(model_path), device=device, compute_type=compute)
 
     def transcribe(self, audio: np.ndarray) -> Transcript:
         import time

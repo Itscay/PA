@@ -286,6 +286,39 @@ def test_hotkey_ignores_unnormalizable_keys(monkeypatch: pytest.MonkeyPatch) -> 
     assert fires == []
 
 
+def test_hotkey_normalize_real_pynput_keys() -> None:
+    """Real pynput key objects must map to combo vocabulary (found live:
+    Windows sends ctrl_l/alt_l and space as char ' ' -- the combo parsed
+    from config could never match without this normalization)."""
+    try:
+        from pynput.keyboard import Key, KeyCode
+    except Exception as exc:  # headless Linux CI: pynput needs a display
+        pytest.skip(f"pynput unavailable: {exc}")
+
+    pt = PushToTalk(on_press=lambda: None, spec="ctrl+alt+space")
+    assert pt._normalize(Key.ctrl_l) == "ctrl"
+    assert pt._normalize(Key.ctrl_r) == "ctrl"
+    assert pt._normalize(Key.alt_l) == "alt"
+    assert pt._normalize(Key.alt_r) == "alt"
+    assert pt._normalize(Key.shift_l) == "shift"
+    assert pt._normalize(Key.space) == "space"
+    assert pt._normalize(KeyCode.from_char(" ")) == "space"  # second flavor
+    assert pt._normalize(KeyCode.from_char("a")) == "a"
+
+    # full combo through the real normalizer fires exactly once
+    fires: list[int] = []
+    pt2 = PushToTalk(on_press=lambda: fires.append(1), spec="ctrl+alt+space")
+    for k in (Key.ctrl_l, Key.alt_l, Key.space):
+        pt2._handle(k, True)
+    assert fires == [1]
+    for k in (Key.space, Key.alt_l, Key.ctrl_l):
+        pt2._handle(k, False)
+    # and again after release
+    for k in (Key.ctrl_r, Key.alt_r, KeyCode.from_char(" ")):
+        pt2._handle(k, True)
+    assert fires == [1, 1]
+
+
 def test_hotkey_defaults_to_ctrl_alt_space() -> None:
     pt = PushToTalk(on_press=lambda: None)
     assert pt._keys == frozenset({"ctrl", "alt", "space"})
@@ -330,3 +363,98 @@ def test_vad_pipeline_segments_fixture_speech() -> None:
     for i in range(0, len(audio), 1600):  # mic cadence
         events.extend(pipeline.feed(audio[i : i + 1600]))
     assert any(str(e).endswith("speech_start") for e in events), events
+
+
+# --- device resolution + resampling (live findings, BUILD_PLAN 9) -----------
+
+
+def test_match_device_prefers_name_over_stale_index() -> None:
+    # Measured on Windows: endpoint indices shift between processes, so a
+    # stored index can point at a different (even unusable) endpoint.
+    devices = [
+        {"index": 18, "name": "Microphone Array 1 (Intel DMIC)", "channels": 2},
+        {"index": 19, "name": "Microphone Array 2 (Intel DMIC)", "channels": 4},
+        {"index": 21, "name": "Input ()", "channels": 2},
+    ]
+    from assistant.audio.capture import match_device_index
+
+    assert match_device_index(devices, "Intel DMIC") == 18  # substring
+    assert match_device_index(devices, "array 2") == 19  # case-insensitive
+    assert (
+        match_device_index(devices, "microphone array 1 (intel dmic)") == 18
+    )  # exact
+    assert match_device_index(devices, 19) == 19  # valid index
+    assert match_device_index(devices, 99) is None  # stale index -> default
+    assert match_device_index(devices, "default") is None
+    assert match_device_index(devices, "") is None
+    assert match_device_index(devices, "AirPods") is None  # unplugged
+
+
+def test_resampler_passthrough_and_48k_decimation() -> None:
+    from assistant.audio.capture import Resampler
+
+    pt = Resampler(16_000, 16_000)
+    x = np.arange(10, dtype=np.float32)
+    np.testing.assert_array_equal(pt.process(x), x)
+
+    r = Resampler(48_000, 16_000)
+    assert r.ratio == 1 / 3
+    # streaming block-by-block == one-shot, and lengths match exactly
+    sig = np.sin(np.arange(48_000, dtype=np.float32) * 0.01)
+    one = r.process(sig)
+    r2 = Resampler(48_000, 16_000)
+    parts = [r2.process(sig[i : i + 1024]) for i in range(0, sig.size, 1024)]
+    np.testing.assert_allclose(np.concatenate(parts), one, atol=1e-6)
+    assert one.size == 16_000
+    # box decimation preserves a constant signal exactly (anti-alias average)
+    flat = Resampler(48_000, 16_000).process(np.full(48_000, 0.5, dtype=np.float32))
+    np.testing.assert_allclose(flat, 0.5, atol=1e-6)
+
+
+def test_resampler_44k1_interpolates_and_keeps_length() -> None:
+    from assistant.audio.capture import Resampler
+
+    r = Resampler(44_100, 16_000)
+    sig = np.linspace(0.0, 1.0, 44_100, dtype=np.float32)
+    # feed in ragged chunks to exercise the phase carry
+    out: list[np.ndarray] = []
+    for i in range(0, sig.size, 701):
+        out.append(r.process(sig[i : i + 701]))
+    y = np.concatenate(out)
+    assert abs(y.size - 16_000) <= 2
+    # monotone ramp stays monotone after resampling (no wrap artifacts)
+    assert np.all(np.diff(y) >= -1e-6)
+    assert y[0] == pytest.approx(0.0, abs=1e-3)
+    assert y[-1] == pytest.approx(1.0, abs=1e-2)
+
+
+def test_resampler_rejects_bad_rates() -> None:
+    from assistant.audio.capture import Resampler
+
+    with pytest.raises(ValueError):
+        Resampler(0, 16_000)
+
+
+def test_mic_capture_resamples_non_16k_device() -> None:
+    """If the device only offers 48 kHz, the ring must still see 16 kHz."""
+    devices = _input_devices()
+    if not devices:
+        pytest.skip("no input device on this runner")
+    from assistant.audio.capture import MicCapture, RingBuffer
+
+    ring = RingBuffer(16_000 * 2)
+    mic = MicCapture(ring, blocksize=1600)
+    try:
+        mic.start()
+    except Exception as exc:  # pragma: no cover - device refusal
+        pytest.skip(f"device unusable on this runner: {exc}")
+    try:
+        time.sleep(0.5)
+        assert mic.opened_rate > 0
+        assert mic.opened_channels >= 1
+        # whatever rate the device opened at, the ring is on the 16 kHz clock:
+        # ~0.5 s of audio -> ~8000 samples (allow slack for startup)
+        n = len(ring)
+        assert 4_000 <= n <= 12_000, f"{n} samples after 0.5 s implies wrong rate"
+    finally:
+        mic.stop()

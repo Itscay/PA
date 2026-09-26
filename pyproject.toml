@@ -17,6 +17,7 @@ dependencies = [
     "faster-whisper>=1.0",
     "pyttsx3>=2.90",
     "pynput>=1.7",
+    "PySide6>=6.6",
 ]
 
 [project.optional-dependencies]
@@ -58,10 +59,14 @@ module = [
     "pynput.*",
     "ctranslate2",
     "faster_whisper",
+    "faster_whisper.*",
     "pyttsx3",
     "onnxruntime",
     "openwakeword",
     "openwakeword.*",
+    "PySide6",
+    "PySide6.*",
+    "shiboken6",
 ]
 ignore_missing_imports = true
 

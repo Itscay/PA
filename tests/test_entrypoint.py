@@ -17,25 +17,6 @@ def test_parser_demo_flag() -> None:
     assert args2.demo is False
 
 
-def test_main_without_demo_returns_phase_notice() -> None:
-    # No second instance running -> prints phase notice, exit code 2 (not built yet)
-    code = main([])
-    assert code == 2
-
-
-def test_main_second_instance_exits_1() -> None:
-    from assistant.single_instance import SingleInstance
-
-    # SingleInstance() default name == what main() uses
-    blocker = SingleInstance()
-    assert blocker.acquire() is True
-    try:
-        code = main([])
-        assert code == 1
-    finally:
-        blocker.release()
-
-
 def test_main_demo_runs_repl(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -69,3 +50,18 @@ def test_main_demo_unknown_and_research(
     out = capsys.readouterr().out
     assert "Sorry, I didn't get that." in out
     assert "research.ask" in out
+
+
+def test_main_second_instance_exits_1(monkeypatch: pytest.MonkeyPatch) -> None:
+    from assistant.single_instance import SingleInstance
+
+    # SingleInstance() default name == what main() uses
+    blocker = SingleInstance()
+    assert blocker.acquire() is True
+    try:
+        # Mock stdin to avoid blocking on input()
+        monkeypatch.setattr("builtins.input", lambda _prompt="": "quit")
+        code = main(["--demo"])
+        assert code == 1
+    finally:
+        blocker.release()

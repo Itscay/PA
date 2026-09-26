@@ -70,13 +70,30 @@ class PushToTalk:
         return self._listener is not None
 
     def _normalize(self, key: object) -> str | None:
+        """Map pynput keys to our combo vocabulary.
+
+        Real pynput events are side-specific and arrive in two flavors:
+        left Ctrl -> ``Key.ctrl_l`` (name "ctrl_l"), and space can be either
+        ``Key.space`` (name "space") or ``KeyCode.from_char(' ')`` (char
+        " "). Without collapsing these, a ``ctrl+alt+space`` combo parsed
+        from config would never match a real key press (verified against
+        live events on Windows).
+        """
         try:
             from pynput.keyboard import Key
 
             if isinstance(key, Key):
-                name = key.name or str(key)
-                return _MODIFIER_ALIASES.get(name.lower(), name.lower())
-            return getattr(key, "char", None)
+                name = (key.name or str(key).rsplit(".", 1)[-1]).lower()
+                if name == "space":
+                    return "space"
+                for base in ("ctrl", "alt", "shift", "cmd"):
+                    if name == base or name.startswith(base + "_"):
+                        return base
+                return name
+            char = getattr(key, "char", None)
+            if char == " ":
+                return "space"
+            return char
         except Exception:
             return None
 
