@@ -4,25 +4,36 @@ Last updated: 2026-09-26
 
 ## Current state
 
-**Phase 0 (Foundations) is implemented and verified locally on Windows; CI has been written but not yet
-run on GitHub, so the Phase 0 acceptance is not fully ticked.** The repo, pyproject (ruff + mypy `--strict`
-+ pytest), config/paths/logging, typed event bus, pure state machine (**100% statement + branch coverage**),
-SQLite activity log, single-instance lock, fakes, and `python -m assistant --demo` text REPL exist and are
-covered by **71 passing tests** (94% overall package coverage), with `ruff check` and `mypy assistant`
-clean.
+**Phase 0 done (except CI execution -- owner action: push). Phase 1 (audio pipeline) code complete and
+locally verified on this Windows PC; two live acceptance items need the owner's voice/hands.**
+
+Verified locally (Windows, Python 3.14): **116 tests green, 88% coverage, state machine 100%, ruff +
+mypy `--strict` clean.** Phase 1 measurements:
+
+| Metric | Target (§3.4) | Measured |
+|---|---|---|
+| STT end-of-speech → transcript (~3 s, base.en int8 CPU, warm) | < 900 ms | **611 ms** (pytest, best of 3) |
+| Idle CPU, wake word running (real-time mic cadence) | < 3 % of one core | **2.60 %** (15 s steady-state) |
+| Wake-phrase detection (SAPI-synthesized "Hey Jarvis") | detect | **0.999** max score |
+| False accepts (unrelated speech / live room audio) | 0 | **0.000** / **0.0000** |
+| Aggregate WER on committed fixtures (base.en + initial-prompt bias) | < 10 % | **0.000** |
+| Audio files written to app dirs during a session | 0 | **0** (pytest scan + live scan) |
 
 Honest gaps (do not treat as done):
 
-- **CI never executed**: `.github/workflows/ci.yml` is written but has no push has happened yet, so
-  "pytest green on both CI OSes" is unverified. Only Windows (Python 3.14) was exercised locally.
-- **Python version drift**: local dev ran on 3.14; the CI matrix targets 3.11/3.12. Nothing was tested on
-  3.11 itself yet.
-- The demo's rule parser (`assistant/demo.py::parse`) is a **placeholder** covering 6 phrase patterns so the
-  pipeline can be exercised; the real grammar is Phase 2.
-- `PermissionGuard`, `ConfirmationManager`, orchestrator, and real skills from §6 are **not built** (Phase 2/3
-  work); the demo fakes confirmation inline.
-- No Windows-specific behaviour (mutex branch, `%LOCALAPPDATA%`) beyond unit tests was validated against a
-  real second app instance or a real desktop.
+- **Phase 1 live acceptance needs the owner:** saying "Hey Jarvis" into the real mic while the app runs,
+  and pressing the push-to-talk hotkey (exact steps in *Owner actions* below).
+- **CI never executed**: `.github/workflows/ci.yml` exists but no git remote/push yet, so "pytest green on
+  both CI OSes" is unverified. Only Windows (Python 3.14) was exercised locally; ubuntu leg and
+  Python 3.11/3.12 untested.
+- **Whisper model SHA-256 manifest not implemented**: faster-whisper downloads via the HF cache without
+  our pinned manifest (deferred to Phase 11's model manager). The Silero VAD model *is* SHA-256 pinned.
+- **CUDA path untested** (no NVIDIA GPU here); detect_device() returns cpu.
+- **Device hot-swap never tested live** (fake getter only; nobody unplugged a mic mid-run).
+- "wake word → overlay/chime < 300 ms" not measurable yet -- no orchestrator/overlay until Phase 2.
+- openWakeWord runs ONNX only: `tflite-runtime` has no Python 3.14 wheel (its faster preferred backend).
+- The demo's rule parser is still a **placeholder** (6 patterns); real grammar is Phase 2. Guard/confirm/
+  skills from §6 are Phase 2/3 work; the demo fakes confirmation inline.
 
 Status marks: `[ ]` todo, `[~]` in progress, `[x]` verified (ran it), `[w]` written but not verifiable in
 this environment.
@@ -45,14 +56,31 @@ this environment.
       - [w] pytest green on **both** CI OSes (verified on Windows only; GitHub Actions not yet run).
 
 ### Phase 1: Audio pipeline
-- [ ] Mic capture + ring buffer + device hot-swap.
-- [ ] openWakeWord ("hey_jarvis"), sensitivity setting, suppression while TTS speaks.
-- [ ] Silero VAD endpointing (start ≤ 300 ms, end after 1.2 s silence, max 8 s).
-- [ ] faster-whisper STT (model download with SHA-256, CPU int8, CUDA auto-detect), initial prompt biasing.
-- [ ] TTS (SAPI) with barge-in; chime sounds.
-- [ ] Push-to-talk hotkey path.
-- [ ] Acceptance: fixture WAVs → WER < 10%; live wake→speak→transcript; latency budgets logged; idle CPU
-      measured; no audio files on disk.
+- [x] Mic capture + ring buffer + device hot-swap.
+      (live mic: 5.9 s captured, 0 dropped blocks; RingBuffer overwrite/wraparound tested;
+      DeviceWatch change-detection tested with a fake -- live unplug never tested)
+- [x] openWakeWord ("hey_jarvis"), sensitivity setting, suppression while TTS speaks.
+      (live: 0.999 on wake phrase, 0.000 on unrelated speech, suppression zeroes output,
+      sensitivity validated; float32→int16 conversion documented -- openWakeWord scores int16 only)
+- [x] Silero VAD endpointing (start ≤ 300 ms, end after 1.2 s silence, max 8 s).
+      (pure Endpointer tests cover all three budgets; real ONNX model verified on SAPI fixtures + live mic;
+      model SHA-256 pinned -- note: the pinned model needs **256-sample** frames, not v5's 512)
+- [~] faster-whisper STT (model download with SHA-256, CPU int8, CUDA auto-detect), initial prompt biasing.
+      (WER 0.000 + 611 ms verified on CPU int8; initial-prompt biasing implemented and proven
+      (unbiased base.en measured 12.8% WER -> biased 0.0); SHA-256 manifest + CUDA path still pending)
+- [x] TTS (SAPI) with barge-in; chime sounds.
+      (live: say() cycles, interrupt flips speaking mid-utterance; chime synthesized in RAM, never written
+      to disk; pyttsx3 hang quirks documented, speak-timeout guard added)
+- [~] Push-to-talk hotkey path.
+      (parse + edge-trigger logic fully unit-tested -- caught & fixed an extra-key re-fire bug;
+      global pynput listener never exercised live -- needs an actual key press, owner action)
+- [~] **Acceptance:** fixture WAVs → correct transcripts (WER < 10%); live wake→speak→transcript; latency
+      budgets logged; idle CPU measured; no audio files on disk.
+      - [x] WER < 10% on fixture set (**0.000**; 10 committed WAVs + manifest in `tests/audio_fixtures/`).
+      - [ ] live wake → speak → transcript (**owner**: say the wake word -- Owner actions below).
+      - [~] latency budgets: STT measured (611 ms ✓); wake→overlay waits on Phase 2 UI/orchestrator.
+      - [x] idle CPU measured (**2.60%**, under the 3% budget).
+      - [x] no audio files on disk (pytest P1 scan + live app-dir scan: 0 files).
 
 ### Phase 2: Understanding + UI + confirmation
 - [ ] Intent schema + registry (schema/registry stub exists in Phase 0; full slot models pending).
@@ -123,10 +151,72 @@ this environment.
 
 ## Open questions / blockers for the owner
 
-- None yet. (OAuth sign-ins, API keys, USB drive, saying the wake word will be collected here as phases
-  reach them.)
+Only the owner can do these three; everything else in Phase 1 is finished:
+
+1. **Push to GitHub (CI):** create a repo, `git remote add origin <url>`, `git push -u origin main`.
+   Actions will then run the workflow; if green, the Phase 0 acceptance line flips from `[w]` to `[x]`.
+2. **Live wake-word acceptance:** in the project directory run
+   `.venv\Scripts\python -m assistant --listen`, then **say "Hey Jarvis, open Chrome"** into the mic.
+   Expected: chime + `[wake] listening...` then `transcript (NNN ms): 'Open Chrome.'`.
+3. **Live push-to-talk acceptance:** with `--listen` still running, **press Ctrl+Alt+Space**, speak any
+   command, expect the same transcript line. (If Windows prompts about keyboard access, allow it.)
+
+(Saved for later phases: OAuth sign-ins, API keys, USB drive, brightness via real laptop keys.)
 
 ## Log (newest first)
+
+### 2026-09-26 — agent — Phase 1 audio pipeline
+- Added audio deps to `pyproject.toml`: numpy, sounddevice, onnxruntime, openWakeWord, faster-whisper,
+  pyttsx3, pynput (all installed and import-tested on Python 3.14; `silero-vad` pip pkg rejected -- it
+  drags in all of torch; `tflite-runtime` has no 3.14 wheel).
+- `assistant/audio/capture.py`: MicCapture (sounddevice, 16 kHz mono, RAM ring buffer with
+  overwrite/wraparound semantics), RingBuffer, list_input_devices, DeviceWatch polling default-device
+  changes, watchdog wait helper.
+- `assistant/audio/vad.py`: **pure** Endpointer (start after 3 frames ≈ 96 ms -- budget ≤ 300 ms; end after
+  1.2 s silence; hard cap 8 s) + SileroVad ONNX wrapper with **SHA-256-pinned** model download
+  (`1a153a22…`). Found empirically: the pinned model scores **256-sample** windows (v5's 512 gives
+  ~0.007 on real speech vs 0.97 with 256); onnxruntime wants a 0-d int64 ndarray for `sr`.
+- `assistant/audio/wakeword.py`: WakeWordEngine ABC + Null + OpenWakeWord. Three empirical fixes, all
+  documented in code: openWakeWord scores **int16** only (float32 gives 0.0001 on speech vs 0.9987 --
+  wrapper converts); `download_models` not `load_models`; scores in **160 ms batches** (2560 samples)
+  because session.run() has ~1 ms fixed overhead.
+  **CPU optimization:** openWakeWord's `_streaming_melspectrogram` did `list(10-second deque)` every
+  80 ms frame just to read the tail (1.53 ms of 3.46 ms/call = 44%). Installed a guarded O(tail)
+  replacement (auto-falls back to stock if upstream changes the method). Idle CPU went 6.1% → **2.60%**
+  (stock+80 ms vs optimized+160 ms), under the 3% budget; detection kept 0.999/0.000.
+- `assistant/audio/stt.py`: SpeechToText ABC + Null + FasterWhisper (base.en int8 CPU default,
+  `detect_device()` CUDA probe, `initial_prompt` biasing, latency measured per call).
+- `assistant/audio/tts.py`: TextToSpeech ABC + Null + SapiTTS on a **dedicated worker thread** (pyttsx3
+  hangs if the engine is created on one thread and used on another; second `runAndWait` after
+  `save_to_file` hangs forever -- `say()` cycles fine). Barge-in `interrupt()` verified live. Added a
+  speak timeout so a dead worker can never block callers.
+- `assistant/audio/chime.py`: wake/tick/cancel cues **synthesized in RAM** (P1 -- no audio asset or file).
+- `assistant/audio/hotkey.py`: PushToTalk with `parse_hotkey` + edge-triggered combo arming (test caught
+  a bug: an extra key pressed while holding the combo used to re-fire it).
+- `assistant/audio/wer.py`: dependency-free WER for acceptance tests.
+- `scripts/make_audio_fixtures.py` → `tests/audio_fixtures/`: **10 committed SAPI TTS WAVs** (16 kHz) +
+  `manifest.json` refs, per the plan's layout (also covers CI, which has no SAPI).
+- `assistant/listen.py` + `--listen` flag: live harness (mic → wake/hotkey → VAD → STT → transcript),
+  holds the single-instance lock. This is what the owner runs for the live acceptance items.
+- New tests: `test_audio.py` (21: ring buffer, endpointer budgets, Silero model+hash, segmenter, hotkey
+  parse, fakes), `test_audio_pipeline.py` (wake detect/false-accept/suppression on real model, SAPI TTS
+  barge-in, mic lifecycle w/ skip, DeviceWatch, hotkey edge-trigger, chime, VadPipeline on fixture),
+  `test_stt_acceptance.py` (WER, latency, P1 disk scan, chime determinism).
+- **How verified (local Windows, Python 3.14):**
+  - `pytest` → **116 passed**; coverage **88%** (CI floor 80); `state.py` still **100%**.
+  - `ruff check assistant tests scripts` and `mypy assistant` (strict, 25 files) → clean.
+  - **WER**: 0.000 aggregate on the fixture set with `initial_prompt` biasing (unbiased base.en measured
+    12.8% -- "Chrome"/"tunnelling"/"thirty" misses; biasing is the fix the plan prescribes).
+  - **STT latency**: 611 ms best-of-3 for the 3.3 s fixture (budget <900 ms).
+  - **Idle CPU**: 2.60% of one core at real-time cadence (budget <3%), 15 s steady-state, `os.times()`.
+  - **Wake word**: 0.999 on `Hey Jarvis` fixture, 0.000 on unrelated speech, 0.000 while suppressed,
+    0.0000 on live room audio (false-accept check).
+  - **Live mic**: 5.9 s captured, 0 dropped blocks, VAD events fired on room speech, warm STT 2234 ms
+    for 5.9 s audio, **0 audio files** created in app dirs (P1).
+  - **TTS**: two `say()` cycles OK; `interrupt()` flipped speaking → False mid-utterance.
+  - `--listen` smoke run: hotkey active, models loaded, mic started, clean shutdown.
+- **Not verified / still open:** owner's live wake-word + hotkey acceptance (steps above); CI run (needs
+  push); whisper SHA-256 manifest (Phase 11); CUDA path (no GPU); live mic unplug (device hot-swap).
 
 ### 2026-09-26 — agent — Phase 0 foundations
 - Created repo (git init on `main`), copied `BUILD_PLAN.md`, added `README.md` skeleton, `.gitignore`.

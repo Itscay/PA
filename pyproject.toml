@@ -10,6 +10,13 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.7",
+    "numpy>=1.26",
+    "sounddevice>=0.4.6",
+    "onnxruntime>=1.17",
+    "openWakeWord>=0.6",
+    "faster-whisper>=1.0",
+    "pyttsx3>=2.90",
+    "pynput>=1.7",
 ]
 
 [project.optional-dependencies]
@@ -37,8 +44,26 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.mypy]
 strict = true
-python_version = "3.11"
+# 3.12 target: newer numpy stubs use `type` statements; our own code stays
+# 3.11-compatible (requires-python) and avoids 3.12+ syntax.
+python_version = "3.12"
 exclude = ["tests/", "\\.venv/"]
+
+# Audio-stack libs ship no py.typed markers; they are wrapped behind our own
+# typed interfaces (assistant/audio/*), so missing stubs are acceptable here.
+[[tool.mypy.overrides]]
+module = [
+    "sounddevice",
+    "pynput",
+    "pynput.*",
+    "ctranslate2",
+    "faster_whisper",
+    "pyttsx3",
+    "onnxruntime",
+    "openwakeword",
+    "openwakeword.*",
+]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

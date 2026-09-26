@@ -21,6 +21,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"pc-assistant {__version__}")
     parser.add_argument("--demo", action="store_true",
                         help="run the core with fakes and a text REPL (Phase 0)")
+    parser.add_argument("--listen", action="store_true",
+                        help="live mic: wake word / push-to-talk -> VAD -> STT "
+                             "transcript (Phase 1 acceptance harness)")
     return parser
 
 
@@ -34,6 +37,16 @@ def main(argv: list[str] | None = None) -> int:
 
         repl()
         return 0
+
+    if args.listen:
+        from assistant.listen import run as listen_run
+
+        # Hold the single-instance lock: two live mic consumers would fight.
+        with SingleInstance() as lock:
+            if not lock.acquired:
+                print("PC Assistant is already running.", file=sys.stderr)
+                return 1
+        return listen_run()
 
     # Phase 1+: real audio pipeline + PySide6 UI. Not built yet (BUILD_PLAN §9).
     with SingleInstance() as lock:
